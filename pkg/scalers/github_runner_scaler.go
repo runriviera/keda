@@ -561,6 +561,30 @@ func (s *githubRunnerScaler) getRateLimit(header http.Header) (RateLimit, error)
 	return rateLimit, nil
 }
 
+func mergeGithubRateLimit(current RateLimit, incoming RateLimit, now time.Time) RateLimit {
+	if current.RetryAfterTime.After(now) && current.RetryAfterTime.After(incoming.RetryAfterTime) {
+		incoming.RetryAfterTime = current.RetryAfterTime
+	}
+
+	if !current.ResetTime.After(now) {
+		return incoming
+	}
+
+	if incoming.ResetTime.Equal(current.ResetTime) {
+		if current.Remaining < incoming.Remaining {
+			incoming.Remaining = current.Remaining
+		}
+		return incoming
+	}
+
+	if incoming.ResetTime.Before(current.ResetTime) {
+		incoming.ResetTime = current.ResetTime
+		incoming.Remaining = current.Remaining
+	}
+
+	return incoming
+}
+
 func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string, metadata *githubRunnerMetadata, httpClient *http.Client) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -595,7 +619,7 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 			s.logger.Error(err, "error getting rate limit")
 		} else {
 			s.stateMu.Lock()
-			s.rateLimit = rateLimit
+			s.rateLimit = mergeGithubRateLimit(s.rateLimit, rateLimit, time.Now())
 			s.stateMu.Unlock()
 		}
 	}

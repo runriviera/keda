@@ -854,6 +854,38 @@ func TestNewGitHubRunnerScaler_QueueLength_SingleRepo_WithRateLimit(t *testing.T
 	}
 }
 
+func TestGetGithubRequest_PreservesMostRestrictiveConcurrentRateLimit(t *testing.T) {
+	resetTime := time.Now().Add(5 * time.Minute).Truncate(time.Second)
+	requestCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetTime.Unix(), 10))
+		if requestCount == 1 {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+		} else {
+			w.Header().Set("X-RateLimit-Remaining", "50")
+		}
+		_, _ = w.Write([]byte(`{}`)) // nosemgrep: no-direct-write-to-responsewriter
+	}))
+	defer srv.Close()
+
+	scaler := githubRunnerScaler{
+		metadata:   getGitHubTestMetaData(srv.URL),
+		httpClient: http.DefaultClient,
+	}
+
+	for range 2 {
+		_, _, err := scaler.getGithubRequest(context.Background(), srv.URL, scaler.metadata, scaler.httpClient)
+		if err != nil {
+			t.Fatalf("unexpected request error: %v", err)
+		}
+	}
+
+	if !scaler.isRateLimited() {
+		t.Fatal("a later response must not relax an exhausted rate limit in the same reset window")
+	}
+}
+
 type githubRunnerMetricIdentifier struct {
 	metadataTestData *map[string]string
 	triggerIndex     int
