@@ -9,10 +9,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	gha "github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/errgroup"
 	v2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,10 +27,12 @@ import (
 )
 
 const (
-	ORG                  = "org"
-	ENT                  = "ent"
-	REPO                 = "repo"
-	githubDefaultPerPage = 30
+	ORG                            = "org"
+	ENT                            = "ent"
+	REPO                           = "repo"
+	githubDefaultPerPage           = 30
+	githubWorkflowStatusQueued     = "queued"
+	githubWorkflowStatusInProgress = "in_progress"
 	// githubScalerMaxCacheEntries caps the etags, previousJobs, and
 	// previousWfrs maps. Without it the etags map grows once per workflow run
 	// for the lifetime of the operator pod (the URL contains the run ID), and
@@ -36,6 +40,10 @@ const (
 	// (previousJobs once per distinct (repository, run ID) pair) returned by
 	// the API.
 	githubScalerMaxCacheEntries = 5000
+	// githubRunnerMaxConcurrentJobRequests bounds the number of GitHub jobs
+	// API requests issued at once while retaining enough parallelism to keep
+	// matrix-heavy workflow scans from becoming serialized.
+	githubRunnerMaxConcurrentJobRequests = 8
 )
 
 var reservedLabels = []string{"self-hosted", "linux", "x64"}
@@ -49,6 +57,8 @@ type jobCacheKey struct {
 }
 
 type githubRunnerScaler struct {
+	scanMu                  sync.Mutex
+	stateMu                 sync.RWMutex
 	metricType              v2.MetricTargetType
 	metadata                *githubRunnerMetadata
 	httpClient              *http.Client
@@ -65,16 +75,17 @@ type githubRunnerScaler struct {
 }
 
 type githubRunnerMetadata struct {
-	GithubAPIURL                           string   `keda:"name=githubApiURL, order=triggerMetadata;resolvedEnv, default=https://api.github.com"`
-	Owner                                  string   `keda:"name=owner, order=triggerMetadata;resolvedEnv"`
-	RunnerScope                            string   `keda:"name=runnerScope, order=triggerMetadata;resolvedEnv, enum=org;ent;repo"`
-	PersonalAccessToken                    string   `keda:"name=personalAccessToken, order=authParams, optional"`
-	Repos                                  []string `keda:"name=repos, order=triggerMetadata;resolvedEnv, optional"`
-	Labels                                 []string `keda:"name=labels, order=triggerMetadata;resolvedEnv, optional"`
-	NoDefaultLabels                        bool     `keda:"name=noDefaultLabels, order=triggerMetadata;resolvedEnv, default=false"`
-	EnableEtags                            bool     `keda:"name=enableEtags, order=triggerMetadata;resolvedEnv, default=false"`
-	MatchUnlabeledJobsWithUnlabeledRunners bool     `keda:"name=matchUnlabeledJobsWithUnlabeledRunners, order=triggerMetadata;resolvedEnv, default=false"`
-	TargetWorkflowQueueLength              int64    `keda:"name=targetWorkflowQueueLength, order=triggerMetadata;resolvedEnv, default=1"`
+	GithubAPIURL                           string        `keda:"name=githubApiURL, order=triggerMetadata;resolvedEnv, default=https://api.github.com"`
+	Owner                                  string        `keda:"name=owner, order=triggerMetadata;resolvedEnv"`
+	RunnerScope                            string        `keda:"name=runnerScope, order=triggerMetadata;resolvedEnv, enum=org;ent;repo"`
+	PersonalAccessToken                    string        `keda:"name=personalAccessToken, order=authParams, optional"`
+	Repos                                  []string      `keda:"name=repos, order=triggerMetadata;resolvedEnv, optional"`
+	Labels                                 []string      `keda:"name=labels, order=triggerMetadata;resolvedEnv, optional"`
+	NoDefaultLabels                        bool          `keda:"name=noDefaultLabels, order=triggerMetadata;resolvedEnv, default=false"`
+	EnableEtags                            bool          `keda:"name=enableEtags, order=triggerMetadata;resolvedEnv, default=false"`
+	WorkflowRunMaxAge                      time.Duration `keda:"name=workflowRunMaxAge, order=triggerMetadata;resolvedEnv, optional"`
+	MatchUnlabeledJobsWithUnlabeledRunners bool          `keda:"name=matchUnlabeledJobsWithUnlabeledRunners, order=triggerMetadata;resolvedEnv, default=false"`
+	TargetWorkflowQueueLength              int64         `keda:"name=targetWorkflowQueueLength, order=triggerMetadata;resolvedEnv, default=1"`
 	TriggerIndex                           int
 	ApplicationID                          int64  `keda:"name=applicationID, order=triggerMetadata;resolvedEnv, optional"`
 	InstallationID                         int64  `keda:"name=installationID, order=triggerMetadata;resolvedEnv, optional"`
@@ -564,7 +575,10 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 	}
 
 	if s.metadata.EnableEtags {
-		if etag, found := s.etags[apiURL]; found {
+		s.stateMu.RLock()
+		etag, found := s.etags[apiURL]
+		s.stateMu.RUnlock()
+		if found {
 			req.Header.Set("If-None-Match", etag)
 		}
 	}
@@ -580,7 +594,9 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 		if err != nil {
 			s.logger.Error(err, "error getting rate limit")
 		} else {
+			s.stateMu.Lock()
 			s.rateLimit = rateLimit
+			s.stateMu.Unlock()
 		}
 	}
 
@@ -592,12 +608,15 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 			return []byte{}, r.StatusCode, nil
 		}
 
-		if s.rateLimit.Remaining == 0 && !s.rateLimit.ResetTime.IsZero() && time.Now().Before(s.rateLimit.ResetTime) {
-			return []byte{}, r.StatusCode, fmt.Errorf("GitHub API rate limit exceeded, reset time %s", s.rateLimit.ResetTime)
+		s.stateMu.RLock()
+		rateLimit := s.rateLimit
+		s.stateMu.RUnlock()
+		if rateLimit.Remaining == 0 && !rateLimit.ResetTime.IsZero() && time.Now().Before(rateLimit.ResetTime) {
+			return []byte{}, r.StatusCode, fmt.Errorf("GitHub API rate limit exceeded, reset time %s", rateLimit.ResetTime)
 		}
 
-		if !s.rateLimit.RetryAfterTime.IsZero() && time.Now().Before(s.rateLimit.RetryAfterTime) {
-			return []byte{}, r.StatusCode, fmt.Errorf("GitHub API rate limit exceeded, retry after %s", s.rateLimit.RetryAfterTime)
+		if !rateLimit.RetryAfterTime.IsZero() && time.Now().Before(rateLimit.RetryAfterTime) {
+			return []byte{}, r.StatusCode, fmt.Errorf("GitHub API rate limit exceeded, retry after %s", rateLimit.RetryAfterTime)
 		}
 
 		return []byte{}, r.StatusCode, fmt.Errorf("the GitHub REST API returned error. url: %s status: %d", apiURL, r.StatusCode)
@@ -610,7 +629,9 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 
 	if s.metadata.EnableEtags {
 		if etag := r.Header.Get("ETag"); etag != "" {
+			s.stateMu.Lock()
 			s.etags[apiURL] = etag
+			s.stateMu.Unlock()
 		}
 	}
 
@@ -621,10 +642,29 @@ func stripDeadRuns(allWfrs []WorkflowRuns) []WorkflowRun {
 	var filtered []WorkflowRun
 	for _, wfrs := range allWfrs {
 		for _, wfr := range wfrs.WorkflowRuns {
-			if wfr.Status == "queued" || wfr.Status == "in_progress" {
+			if wfr.Status == githubWorkflowStatusQueued || wfr.Status == githubWorkflowStatusInProgress {
 				filtered = append(filtered, wfr)
 			}
 		}
+	}
+	return filtered
+}
+
+// filterStaleQueuedWorkflowRuns drops queued runs older than maxAge. Runs
+// that are in progress, have no creation timestamp, or are exactly on the
+// cutoff remain visible so incomplete GitHub data cannot hide active work.
+func filterStaleQueuedWorkflowRuns(wfrs []WorkflowRun, maxAge time.Duration, now time.Time) []WorkflowRun {
+	if maxAge <= 0 {
+		return wfrs
+	}
+
+	cutoff := now.Add(-maxAge)
+	filtered := make([]WorkflowRun, 0, len(wfrs))
+	for _, wfr := range wfrs {
+		if wfr.Status == githubWorkflowStatusQueued && !wfr.CreatedAt.IsZero() && wfr.CreatedAt.Before(cutoff) {
+			continue
+		}
+		filtered = append(filtered, wfr)
 	}
 	return filtered
 }
@@ -649,12 +689,17 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 	}
 	key := jobCacheKey{repo: repoName, runID: workflowRunID}
 	if statusCode == 304 && s.metadata.EnableEtags {
-		if jobs, ok := s.previousJobs[key]; ok {
+		s.stateMu.RLock()
+		jobs, ok := s.previousJobs[key]
+		s.stateMu.RUnlock()
+		if ok {
 			return jobs, nil
 		}
 		// Stale etag without a paired previousJobs entry, e.g. after pruneCaches
 		// evicted the previous entry. Drop the etag and retry as a cache miss.
+		s.stateMu.Lock()
 		delete(s.etags, apiURL)
+		s.stateMu.Unlock()
 		body, statusCode, err = s.getGithubRequest(ctx, apiURL, s.metadata, s.httpClient)
 		if err != nil {
 			return nil, err
@@ -671,7 +716,9 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 	}
 
 	if s.metadata.EnableEtags {
+		s.stateMu.Lock()
 		s.previousJobs[key] = jobs.Jobs
+		s.stateMu.Unlock()
 	}
 
 	return jobs.Jobs, nil
@@ -692,12 +739,17 @@ func (s *githubRunnerScaler) getWorkflowRuns(ctx context.Context, repoName strin
 		return nil, err
 	}
 	if statusCode == 304 && s.metadata.EnableEtags {
-		if s.previousWfrs[repoName][status] != nil {
-			return s.previousWfrs[repoName][status], nil
+		s.stateMu.RLock()
+		previousWfrs := s.previousWfrs[repoName][status]
+		s.stateMu.RUnlock()
+		if previousWfrs != nil {
+			return previousWfrs, nil
 		}
 		// Stale etag without a paired previousWfrs entry, e.g. after pruneCaches
 		// evicted the previous entry. Drop the etag and retry as a cache miss.
+		s.stateMu.Lock()
 		delete(s.etags, apiURL)
+		s.stateMu.Unlock()
 		body, statusCode, err = s.getGithubRequest(ctx, apiURL, s.metadata, s.httpClient)
 		if err != nil && statusCode == 404 {
 			return nil, nil
@@ -716,11 +768,13 @@ func (s *githubRunnerScaler) getWorkflowRuns(ctx context.Context, repoName strin
 	}
 
 	if s.metadata.EnableEtags {
+		s.stateMu.Lock()
 		if _, repoFound := s.previousWfrs[repoName]; !repoFound {
 			s.previousWfrs[repoName] = map[string]*WorkflowRuns{status: &wfrs}
 		} else {
 			s.previousWfrs[repoName][status] = &wfrs
 		}
+		s.stateMu.Unlock()
 	}
 
 	return &wfrs, nil
@@ -755,14 +809,17 @@ func (s *githubRunnerScaler) canRunnerMatchLabels(jobLabels []string, runnerLabe
 // isRateLimited determines whether to use the cached previousQueueLength to avoid further calls to the Github API
 func (s *githubRunnerScaler) isRateLimited() bool {
 	now := time.Now()
+	s.stateMu.RLock()
+	rateLimit := s.rateLimit
+	s.stateMu.RUnlock()
 
-	if s.rateLimit.Remaining == 0 && !s.rateLimit.ResetTime.IsZero() && now.Before(s.rateLimit.ResetTime) {
-		s.logger.V(1).Info(fmt.Sprintf("Github API rate limit exceeded. Rate limited until %s", s.rateLimit.ResetTime))
+	if rateLimit.Remaining == 0 && !rateLimit.ResetTime.IsZero() && now.Before(rateLimit.ResetTime) {
+		s.logger.V(1).Info(fmt.Sprintf("Github API rate limit exceeded. Rate limited until %s", rateLimit.ResetTime))
 		return true
 	}
 
-	if !s.rateLimit.RetryAfterTime.IsZero() && now.Before(s.rateLimit.RetryAfterTime) {
-		s.logger.V(1).Info(fmt.Sprintf("Github API rate limit exceeded. Rate limited until %s", s.rateLimit.RetryAfterTime))
+	if !rateLimit.RetryAfterTime.IsZero() && now.Before(rateLimit.RetryAfterTime) {
+		s.logger.V(1).Info(fmt.Sprintf("Github API rate limit exceeded. Rate limited until %s", rateLimit.RetryAfterTime))
 		return true
 	}
 
@@ -771,13 +828,17 @@ func (s *githubRunnerScaler) isRateLimited() bool {
 
 // getCachedQueueLength returns the cached previous queue length
 func (s *githubRunnerScaler) getCachedQueueLength() (int64, error) {
-	if !s.previousQueueLengthTime.IsZero() {
+	s.stateMu.RLock()
+	previousQueueLength := s.previousQueueLength
+	previousQueueLengthTime := s.previousQueueLengthTime
+	s.stateMu.RUnlock()
+	if !previousQueueLengthTime.IsZero() {
 		if s.recorder != nil {
 			s.recorder.Eventf(s.scaledObject, nil, corev1.EventTypeNormal, eventreason.KEDAScalersInfo, eventreason.KEDAScalersInfo,
 				fmt.Sprintf("Github API rate limit exceeded. Cached queue length: %d, last successful cache at %s",
-					s.previousQueueLength, s.previousQueueLengthTime))
+					previousQueueLength, previousQueueLengthTime))
 		}
-		return s.previousQueueLength, nil
+		return previousQueueLength, nil
 	}
 
 	return -1, fmt.Errorf("GitHub API rate limit exceeded. No cached queue length available")
@@ -794,6 +855,9 @@ func (s *githubRunnerScaler) getCachedQueueLength() (int64, error) {
 // the current run list is known (see GetWorkflowQueueLength); the
 // evictExcess cap below is a size-based backstop for both.
 func (s *githubRunnerScaler) pruneCaches(currentRepos []string) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
 	repoSet := make(map[string]struct{}, len(currentRepos))
 	for _, r := range currentRepos {
 		repoSet[r] = struct{}{}
@@ -812,6 +876,9 @@ func (s *githubRunnerScaler) pruneCaches(currentRepos []string) {
 // longer queued/in_progress, so a completed run's cached job list is not
 // held indefinitely waiting for size-based eviction in pruneCaches.
 func (s *githubRunnerScaler) pruneCompletedJobs(activeWfrs []WorkflowRun) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+
 	active := make(map[jobCacheKey]struct{}, len(activeWfrs))
 	for _, wfr := range activeWfrs {
 		active[jobCacheKey{repo: wfr.Repository.Name, runID: wfr.ID}] = struct{}{}
@@ -822,6 +889,28 @@ func (s *githubRunnerScaler) pruneCompletedJobs(activeWfrs []WorkflowRun) {
 			delete(s.etags, s.jobsAPIURL(key.repo, key.runID))
 		}
 	}
+}
+
+func (s *githubRunnerScaler) getWorkflowRunJobsConcurrently(ctx context.Context, wfrs []WorkflowRun) ([][]Job, error) {
+	jobsByRun := make([][]Job, len(wfrs))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(githubRunnerMaxConcurrentJobRequests)
+
+	for i := range wfrs {
+		group.Go(func() error {
+			jobs, err := s.getWorkflowRunJobs(groupCtx, wfrs[i].ID, wfrs[i].Repository.Name)
+			if err != nil {
+				return err
+			}
+			jobsByRun[i] = jobs
+			return nil
+		})
+	}
+
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	return jobsByRun, nil
 }
 
 // evictExcess removes arbitrary entries from m until len(m) <= limit. Map
@@ -839,6 +928,9 @@ func evictExcess[K comparable, V any](m map[K]V, limit int) {
 
 // GetWorkflowQueueLength returns the number of workflow jobs in the queue
 func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64, error) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+
 	if s.isRateLimited() {
 		return s.getCachedQueueLength()
 	}
@@ -861,7 +953,7 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 	var allWfrs []WorkflowRuns
 
 	for _, repo := range repos {
-		wfrsQueued, err := s.getWorkflowRuns(ctx, repo, "queued")
+		wfrsQueued, err := s.getWorkflowRuns(ctx, repo, githubWorkflowStatusQueued)
 		if err != nil {
 			if s.isRateLimited() {
 				return s.getCachedQueueLength()
@@ -871,7 +963,7 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 		if wfrsQueued != nil {
 			allWfrs = append(allWfrs, *wfrsQueued)
 		}
-		wfrsInProgress, err := s.getWorkflowRuns(ctx, repo, "in_progress")
+		wfrsInProgress, err := s.getWorkflowRuns(ctx, repo, githubWorkflowStatusInProgress)
 		if err != nil {
 			if s.isRateLimited() {
 				return s.getCachedQueueLength()
@@ -885,33 +977,37 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 
 	var queueCount int64
 
-	wfrs := stripDeadRuns(allWfrs)
+	wfrs := filterStaleQueuedWorkflowRuns(stripDeadRuns(allWfrs), s.metadata.WorkflowRunMaxAge, time.Now())
 
 	if s.metadata.EnableEtags {
 		s.pruneCompletedJobs(wfrs)
 	}
 
-	for _, wfr := range wfrs {
-		jobs, err := s.getWorkflowRunJobs(ctx, wfr.ID, wfr.Repository.Name)
-		if err != nil {
-			if s.isRateLimited() {
-				return s.getCachedQueueLength()
-			}
-			return -1, err
+	jobsByRun, err := s.getWorkflowRunJobsConcurrently(ctx, wfrs)
+	if err != nil {
+		if s.isRateLimited() {
+			return s.getCachedQueueLength()
 		}
+		return -1, err
+	}
+	for _, jobs := range jobsByRun {
 		for _, job := range jobs {
-			if (job.Status == "queued" || job.Status == "in_progress") && s.canRunnerMatchLabels(job.Labels, s.metadata.Labels, s.metadata.NoDefaultLabels) {
+			if (job.Status == githubWorkflowStatusQueued || job.Status == githubWorkflowStatusInProgress) && s.canRunnerMatchLabels(job.Labels, s.metadata.Labels, s.metadata.NoDefaultLabels) {
 				queueCount++
 			}
 		}
 	}
 
+	s.stateMu.Lock()
 	s.previousQueueLength = queueCount
 	s.previousQueueLengthTime = time.Now()
+	previousQueueLength := s.previousQueueLength
+	previousQueueLengthTime := s.previousQueueLengthTime
+	s.stateMu.Unlock()
 	s.logger.V(1).Info(fmt.Sprintf(
 		"Successful workflow queue count. Caching previous queue length %d, previous queue length time %s",
-		s.previousQueueLength,
-		s.previousQueueLengthTime,
+		previousQueueLength,
+		previousQueueLengthTime,
 	))
 
 	return queueCount, nil

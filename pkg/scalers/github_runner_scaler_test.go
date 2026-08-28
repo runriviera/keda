@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1106,6 +1107,205 @@ func TestGetWorkflowRuns_StaleEtagWithoutPreviousRetries(t *testing.T) {
 	}
 	if got := s.etags[apiURL]; got != `"fresh-etag"` {
 		t.Fatalf("expected etag to be refreshed to %q, got %q", `"fresh-etag"`, got)
+	}
+}
+
+func TestGetWorkflowQueueLength_WorkflowRunMaxAgeSkipsOnlyOldQueuedRuns(t *testing.T) {
+	now := time.Now()
+	queuedRuns := WorkflowRuns{WorkflowRuns: []WorkflowRun{
+		{ID: 1, Status: "queued", CreatedAt: now.Add(-25 * time.Hour), Repository: Repo{Name: "repo"}},
+		{ID: 2, Status: "queued", CreatedAt: now.Add(-23 * time.Hour), Repository: Repo{Name: "repo"}},
+		{ID: 3, Status: "queued", Repository: Repo{Name: "repo"}},
+	}}
+	inProgressRuns := WorkflowRuns{WorkflowRuns: []WorkflowRun{
+		{ID: 4, Status: "in_progress", CreatedAt: now.Add(-25 * time.Hour), Repository: Repo{Name: "repo"}},
+	}}
+
+	var requestedJobRunsMu sync.Mutex
+	requestedJobRuns := map[int64]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/actions/runs/") && strings.HasSuffix(r.URL.Path, "/jobs") {
+			parts := strings.Split(r.URL.Path, "/")
+			runID, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+			if err != nil {
+				t.Errorf("unexpected run ID in %q: %v", r.URL.Path, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			requestedJobRunsMu.Lock()
+			requestedJobRuns[runID] = true
+			requestedJobRunsMu.Unlock()
+			_ = json.NewEncoder(w).Encode(Jobs{TotalCount: 1, Jobs: []Job{{ID: int(runID), RunID: int(runID), Status: "queued", Labels: []string{"self-hosted", "linux", "x64", "gcp"}}}})
+			return
+		}
+
+		if strings.Contains(r.URL.Path, "/actions/runs") {
+			if r.URL.Query().Get("status") == "in_progress" {
+				_ = json.NewEncoder(w).Encode(inProgressRuns)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(queuedRuns)
+			return
+		}
+
+		t.Errorf("unexpected request: %s", r.URL.String())
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	meta, err := parseGitHubRunnerMetadata(&scalersconfig.ScalerConfig{
+		TriggerMetadata: map[string]string{
+			"githubApiURL":      srv.URL,
+			"runnerScope":       REPO,
+			"owner":             "owner",
+			"repos":             "repo",
+			"labels":            "gcp",
+			"workflowRunMaxAge": "24h",
+		},
+		AuthParams: testAuthParams,
+	})
+	if err != nil {
+		t.Fatalf("unexpected metadata error: %v", err)
+	}
+
+	scaler := githubRunnerScaler{metadata: meta, httpClient: http.DefaultClient}
+	queueLen, err := scaler.GetWorkflowQueueLength(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected queue scan error: %v", err)
+	}
+	if queueLen != 3 {
+		t.Fatalf("expected fresh, unknown-age, and in-progress jobs only; got queue length %d", queueLen)
+	}
+
+	requestedJobRunsMu.Lock()
+	defer requestedJobRunsMu.Unlock()
+	if requestedJobRuns[1] {
+		t.Fatal("old queued run should not trigger a jobs request")
+	}
+	for _, runID := range []int64{2, 3, 4} {
+		if !requestedJobRuns[runID] {
+			t.Fatalf("expected jobs request for run %d", runID)
+		}
+	}
+}
+
+func TestGetWorkflowQueueLength_BoundsConcurrentJobRequests(t *testing.T) {
+	const (
+		runCount         = 12
+		expectedMaxInFly = 8
+	)
+
+	runs := make([]WorkflowRun, 0, runCount)
+	for runID := 1; runID <= runCount; runID++ {
+		runs = append(runs, WorkflowRun{
+			ID:         int64(runID),
+			Status:     "queued",
+			CreatedAt:  time.Now(),
+			Repository: Repo{Name: "repo"},
+		})
+	}
+
+	started := make(chan struct{}, runCount)
+	release := make(chan struct{})
+	var concurrencyMu sync.Mutex
+	currentInFlight := 0
+	maxInFlight := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/actions/runs/") && strings.HasSuffix(r.URL.Path, "/jobs") {
+			parts := strings.Split(r.URL.Path, "/")
+			runID, err := strconv.Atoi(parts[len(parts)-2])
+			if err != nil {
+				t.Errorf("unexpected run ID in %q: %v", r.URL.Path, err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			concurrencyMu.Lock()
+			currentInFlight++
+			if currentInFlight > maxInFlight {
+				maxInFlight = currentInFlight
+			}
+			concurrencyMu.Unlock()
+			started <- struct{}{}
+			<-release
+			concurrencyMu.Lock()
+			currentInFlight--
+			concurrencyMu.Unlock()
+
+			w.Header().Set("ETag", strconv.Quote(strconv.Itoa(runID)))
+			_ = json.NewEncoder(w).Encode(Jobs{TotalCount: 1, Jobs: []Job{{ID: runID, RunID: runID, Status: "queued", Labels: []string{"self-hosted", "linux", "x64", "gcp"}}}})
+			return
+		}
+
+		if strings.Contains(r.URL.Path, "/actions/runs") {
+			w.Header().Set("ETag", fmt.Sprintf("%q", r.URL.Query().Get("status")))
+			if r.URL.Query().Get("status") == "in_progress" {
+				_ = json.NewEncoder(w).Encode(WorkflowRuns{})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(WorkflowRuns{TotalCount: runCount, WorkflowRuns: runs})
+			return
+		}
+
+		t.Errorf("unexpected request: %s", r.URL.String())
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	meta := getGitHubTestMetaData(srv.URL)
+	meta.Repos = []string{"repo"}
+	meta.Labels = []string{"gcp"}
+	meta.EnableEtags = true
+	scaler := githubRunnerScaler{
+		metadata:     meta,
+		httpClient:   http.DefaultClient,
+		etags:        map[string]string{},
+		previousJobs: map[jobCacheKey][]Job{},
+		previousWfrs: map[string]map[string]*WorkflowRuns{},
+	}
+
+	type scanResult struct {
+		queueLen int64
+		err      error
+	}
+	result := make(chan scanResult, 1)
+	go func() {
+		queueLen, err := scaler.GetWorkflowQueueLength(context.Background())
+		result <- scanResult{queueLen: queueLen, err: err}
+	}()
+
+	for request := 0; request < expectedMaxInFly; request++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			close(release)
+			<-result
+			t.Fatalf("expected %d concurrent job requests, but only %d started before timeout", expectedMaxInFly, request)
+		}
+	}
+
+	select {
+	case <-started:
+		close(release)
+		<-result
+		t.Fatalf("more than %d job requests were allowed in flight", expectedMaxInFly)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	got := <-result
+	if got.err != nil {
+		t.Fatalf("unexpected queue scan error: %v", got.err)
+	}
+	if got.queueLen != runCount {
+		t.Fatalf("expected queue length %d, got %d", runCount, got.queueLen)
+	}
+
+	concurrencyMu.Lock()
+	defer concurrencyMu.Unlock()
+	if maxInFlight != expectedMaxInFly {
+		t.Fatalf("expected peak concurrency %d, got %d", expectedMaxInFly, maxInFlight)
 	}
 }
 

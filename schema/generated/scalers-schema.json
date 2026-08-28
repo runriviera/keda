@@ -2327,6 +2327,13 @@
                     "envVariableReadable": true
                 },
                 {
+                    "name": "workflowRunMaxAge",
+                    "type": "string",
+                    "optional": true,
+                    "metadataVariableReadable": true,
+                    "envVariableReadable": true
+                },
+                {
                     "name": "matchUnlabeledJobsWithUnlabeledRunners",
                     "type": "string",
                     "default": "false",

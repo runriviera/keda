@@ -79,6 +79,7 @@ To learn more about active deprecations, we recommend checking [GitHub Discussio
 
 ### Improvements
 
+- **Github Runner Scaler**: Add an optional queued workflow run age limit and fetch workflow-run jobs with bounded concurrency to reduce scan latency from stale and matrix-heavy run lists ([#2](https://github.com/runriviera/keda/issues/2))
 - TODO ([#XXX](https://github.com/kedacore/keda/issues/XXX))
 
 ### Fixes
