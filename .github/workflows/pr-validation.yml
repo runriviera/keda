@@ -8,6 +8,7 @@ concurrency:
 
 jobs:
   validate:
+    if: github.repository == 'kedacore/keda'
     name: validate - ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     container:
@@ -126,6 +127,7 @@ jobs:
             report-race.xml
 
   validate-dockerfiles:
+    if: github.repository == 'kedacore/keda'
     permissions:
       contents: read # for dorny/paths-filter to fetch a list of changed files
       pull-requests: read # for dorny/paths-filter to read pull requests
@@ -162,6 +164,7 @@ jobs:
         run: make docker-build
 
   validate-dev-container:
+    if: github.repository == 'kedacore/keda'
     permissions:
       contents: read # for dorny/paths-filter to fetch a list of changed files
       pull-requests: read # for dorny/paths-filter to read pull requests
@@ -195,6 +198,7 @@ jobs:
         run: make docker-build-dev-containers
 
   statics:
+    if: github.repository == 'kedacore/keda'
     name: Static Checks
     runs-on: ubuntu-latest
     steps:
