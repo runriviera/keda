@@ -1,0 +1,86 @@
+name: Riviera GitHub scaler CI
+
+on:
+  pull_request:
+    branches:
+      - riviera/v2.20.2
+  push:
+    branches:
+      - riviera/v2.20.2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: riviera-github-scaler-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  github-scaler:
+    name: GitHub scaler tests, race detector, and vet
+    if: github.repository == 'runriviera/keda'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GOMAXPROCS: '2'
+      GOFLAGS: -p=2
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check GitHub scaler formatting
+        run: test -z "$(gofmt -l pkg/scalers/github_runner*.go)"
+
+      - name: Run scaler package tests
+        run: go test -count=1 -timeout=20m ./pkg/scalers
+
+      - name: Run GitHub scaler race tests
+        run: go test -race -count=1 -timeout=15m ./pkg/scalers -run 'Git[Hh]ub|WorkflowRun|WorkflowQueueLength'
+
+      - name: Run scaler static analysis
+        run: go vet ./pkg/scalers
+
+  github-scaler-lint:
+    name: GitHub scaler changed-line lint
+    if: github.repository == 'runriviera/keda'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: '2'
+      GOFLAGS: -p=2
+    steps:
+      - name: Check out repository and lint base history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Validate exact lint base revision
+        id: lint-base
+        env:
+          LINT_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          [[ "$LINT_BASE_SHA" =~ ^[0-9a-f]{40}$ && ! "$LINT_BASE_SHA" =~ ^0+$ ]]
+          git cat-file -e "$LINT_BASE_SHA^{commit}"
+          echo "sha=$LINT_BASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Lint changed scaler lines
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.11.4 # Keep aligned with GOLANGCI_VERSION in Makefile.
+          args: --timeout=15m --concurrency=2 --new-from-rev=${{ steps.lint-base.outputs.sha }} ./pkg/scalers/...
+          skip-cache: true

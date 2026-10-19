@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   check-creator:
+    if: github.repository == 'kedacore/keda'
     name: check-creator
     runs-on: ubuntu-slim
     steps:

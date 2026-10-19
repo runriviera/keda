@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   pr_bot:
+    if: github.repository == 'kedacore/keda'
     name: PR Bot
     runs-on: ubuntu-slim
     steps:
