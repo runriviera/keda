@@ -33,7 +33,7 @@ const (
 	githubDefaultPerPage           = 30
 	githubWorkflowStatusQueued     = "queued"
 	githubWorkflowStatusInProgress = "in_progress"
-	// githubScalerMaxCacheEntries caps the etags, previousJobs, and
+	// githubScalerMaxCacheEntries caps the etags, cached job pages, and
 	// previousWfrs maps. Without it the etags map grows once per workflow run
 	// for the lifetime of the operator pod (the URL contains the run ID), and
 	// previousJobs and previousWfrs grow once per distinct repository name
@@ -44,6 +44,9 @@ const (
 	// API requests issued at once while retaining enough parallelism to keep
 	// matrix-heavy workflow scans from becoming serialized.
 	githubRunnerMaxConcurrentJobRequests = 8
+	// Bound pagination even if GitHub returns an inconsistent or growing total.
+	// Exceeding this limit fails the scan instead of publishing partial demand.
+	githubRunnerMaxJobPages = 1000
 )
 
 var reservedLabels = []string{"self-hosted", "linux", "x64"}
@@ -54,6 +57,13 @@ var reservedLabels = []string{"self-hosted", "linux", "x64"}
 type jobCacheKey struct {
 	repo  string
 	runID int64
+}
+
+// githubJobPage keeps a page's validator paired with the exact decoded response.
+// Pages are replaced together only after a complete run has been fetched.
+type githubJobPage struct {
+	etag string
+	jobs Jobs
 }
 
 type githubRunnerScaler struct {
@@ -68,7 +78,7 @@ type githubRunnerScaler struct {
 	etags                   map[string]string
 	previousRepos           []string
 	previousWfrs            map[string]map[string]*WorkflowRuns
-	previousJobs            map[jobCacheKey][]Job
+	previousJobs            map[jobCacheKey][]githubJobPage
 	rateLimit               RateLimit
 	previousQueueLength     int64
 	previousQueueLengthTime time.Time
@@ -400,7 +410,7 @@ func NewGitHubRunnerScaler(config *scalersconfig.ScalerConfig) (Scaler, error) {
 
 	etags := make(map[string]string)
 	previousRepos := []string{}
-	previousJobs := make(map[jobCacheKey][]Job)
+	previousJobs := make(map[jobCacheKey][]githubJobPage)
 	previousWfrs := make(map[string]map[string]*WorkflowRuns)
 	rateLimit := RateLimit{}
 	previousQueueLength := int64(0)
@@ -586,9 +596,28 @@ func mergeGithubRateLimit(current RateLimit, incoming RateLimit, now time.Time) 
 }
 
 func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string, metadata *githubRunnerMetadata, httpClient *http.Client) ([]byte, int, error) {
+	var etag string
+	if metadata.EnableEtags {
+		s.stateMu.RLock()
+		etag = s.etags[apiURL]
+		s.stateMu.RUnlock()
+	}
+	body, statusCode, nextETag, err := s.getGithubRequestWithETag(ctx, apiURL, metadata, httpClient, etag)
+	if err == nil && metadata.EnableEtags && nextETag != "" {
+		s.stateMu.Lock()
+		if s.etags == nil {
+			s.etags = make(map[string]string)
+		}
+		s.etags[apiURL] = nextETag
+		s.stateMu.Unlock()
+	}
+	return body, statusCode, err
+}
+
+func (s *githubRunnerScaler) getGithubRequestWithETag(ctx context.Context, apiURL string, metadata *githubRunnerMetadata, httpClient *http.Client, etag string) ([]byte, int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		return []byte{}, -1, err
+		return nil, -1, "", err
 	}
 
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
@@ -598,18 +627,13 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 		req.Header.Set("Authorization", "Bearer "+metadata.PersonalAccessToken)
 	}
 
-	if s.metadata.EnableEtags {
-		s.stateMu.RLock()
-		etag, found := s.etags[apiURL]
-		s.stateMu.RUnlock()
-		if found {
-			req.Header.Set("If-None-Match", etag)
-		}
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
 
 	r, err := httpClient.Do(req)
 	if err != nil {
-		return []byte{}, -1, err
+		return nil, -1, "", err
 	}
 	defer r.Body.Close()
 
@@ -629,37 +653,29 @@ func (s *githubRunnerScaler) getGithubRequest(ctx context.Context, apiURL string
 
 		if r.StatusCode == 304 && s.metadata.EnableEtags {
 			s.logger.V(1).Info(fmt.Sprintf("The github rest api for the url: %s returned status %d %s", apiURL, r.StatusCode, http.StatusText(r.StatusCode)))
-			return []byte{}, r.StatusCode, nil
+			return nil, r.StatusCode, "", nil
 		}
 
 		s.stateMu.RLock()
 		rateLimit := s.rateLimit
 		s.stateMu.RUnlock()
 		if rateLimit.Remaining == 0 && !rateLimit.ResetTime.IsZero() && time.Now().Before(rateLimit.ResetTime) {
-			return []byte{}, r.StatusCode, fmt.Errorf("GitHub API rate limit exceeded, reset time %s", rateLimit.ResetTime)
+			return nil, r.StatusCode, "", fmt.Errorf("GitHub API rate limit exceeded, reset time %s", rateLimit.ResetTime)
 		}
 
 		if !rateLimit.RetryAfterTime.IsZero() && time.Now().Before(rateLimit.RetryAfterTime) {
-			return []byte{}, r.StatusCode, fmt.Errorf("GitHub API rate limit exceeded, retry after %s", rateLimit.RetryAfterTime)
+			return nil, r.StatusCode, "", fmt.Errorf("GitHub API rate limit exceeded, retry after %s", rateLimit.RetryAfterTime)
 		}
 
-		return []byte{}, r.StatusCode, fmt.Errorf("the GitHub REST API returned error. url: %s status: %d", apiURL, r.StatusCode)
+		return nil, r.StatusCode, "", fmt.Errorf("the GitHub REST API returned error. url: %s status: %d", apiURL, r.StatusCode)
 	}
 
 	b, err := io.ReadAll(r.Body)
 	if err != nil {
-		return []byte{}, -1, err
+		return nil, -1, "", err
 	}
 
-	if s.metadata.EnableEtags {
-		if etag := r.Header.Get("ETag"); etag != "" {
-			s.stateMu.Lock()
-			s.etags[apiURL] = etag
-			s.stateMu.Unlock()
-		}
-	}
-
-	return b, r.StatusCode, nil
+	return b, r.StatusCode, r.Header.Get("ETag"), nil
 }
 
 func stripDeadRuns(allWfrs []WorkflowRuns) []WorkflowRun {
@@ -693,59 +709,84 @@ func filterStaleQueuedWorkflowRuns(wfrs []WorkflowRun, maxAge time.Duration, now
 	return filtered
 }
 
-// jobsAPIURL returns the GitHub API URL for a workflow run's jobs, used both
-// to fetch the jobs and as the etags cache key for that same request.
-func (s *githubRunnerScaler) jobsAPIURL(repoName string, workflowRunID int64) string {
-	return fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100",
+// jobsAPIURL returns one page of a workflow run's jobs. Smaller responses avoid
+// GitHub gateway timeouts on matrix-heavy workflows.
+func (s *githubRunnerScaler) jobsAPIURL(repoName string, workflowRunID int64, page int) string {
+	return fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=%d&page=%d",
 		s.metadata.GithubAPIURL,
 		url.PathEscape(s.metadata.Owner),
 		url.PathEscape(repoName),
-		workflowRunID)
+		workflowRunID, githubDefaultPerPage, page)
 }
 
-// getWorkflowRunJobs returns a list of jobs for a given workflow run
+// getWorkflowRunJobs returns a complete, freshly validated list of jobs for a run.
 func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRunID int64, repoName string) ([]Job, error) {
-	apiURL := s.jobsAPIURL(repoName, workflowRunID)
-
-	body, statusCode, err := s.getGithubRequest(ctx, apiURL, s.metadata, s.httpClient)
-	if err != nil {
-		return nil, err
-	}
 	key := jobCacheKey{repo: repoName, runID: workflowRunID}
-	if statusCode == 304 && s.metadata.EnableEtags {
-		s.stateMu.RLock()
-		jobs, ok := s.previousJobs[key]
-		s.stateMu.RUnlock()
-		if ok {
+	s.stateMu.RLock()
+	previousPages := s.previousJobs[key]
+	s.stateMu.RUnlock()
+
+	var pages []githubJobPage
+	var jobs []Job
+	totalCount := -1
+	seen := make(map[int]struct{})
+	for page := 1; page <= githubRunnerMaxJobPages; page++ {
+		apiURL := s.jobsAPIURL(repoName, workflowRunID, page)
+		var cached githubJobPage
+		if s.metadata.EnableEtags && page <= len(previousPages) {
+			cached = previousPages[page-1]
+		}
+		body, statusCode, etag, err := s.getGithubRequestWithETag(ctx, apiURL, s.metadata, s.httpClient, cached.etag)
+		if err != nil {
+			return nil, fmt.Errorf("get workflow run %d jobs page %d: %w", workflowRunID, page, err)
+		}
+
+		var current githubJobPage
+		if statusCode == http.StatusNotModified {
+			if cached.etag == "" {
+				return nil, fmt.Errorf("workflow run %d jobs page %d returned 304 without a cached page", workflowRunID, page)
+			}
+			current = cached
+		} else {
+			if err := json.Unmarshal(body, &current.jobs); err != nil {
+				return nil, fmt.Errorf("decode workflow run %d jobs page %d: %w", workflowRunID, page, err)
+			}
+			current.etag = etag
+		}
+
+		if page == 1 {
+			totalCount = current.jobs.TotalCount
+			if totalCount < 0 || totalCount > githubRunnerMaxJobPages*githubDefaultPerPage {
+				return nil, fmt.Errorf("workflow run %d job count %d exceeds pagination bounds", workflowRunID, totalCount)
+			}
+		} else if current.jobs.TotalCount != totalCount {
+			return nil, fmt.Errorf("workflow run %d job count changed during pagination: %d to %d", workflowRunID, totalCount, current.jobs.TotalCount)
+		}
+		expected := min(githubDefaultPerPage, totalCount-len(jobs))
+		if len(current.jobs.Jobs) != expected {
+			return nil, fmt.Errorf("workflow run %d jobs page %d returned %d jobs, expected %d", workflowRunID, page, len(current.jobs.Jobs), expected)
+		}
+		for _, job := range current.jobs.Jobs {
+			if _, ok := seen[job.ID]; ok {
+				return nil, fmt.Errorf("workflow run %d returned duplicate job %d during pagination", workflowRunID, job.ID)
+			}
+			seen[job.ID] = struct{}{}
+		}
+		jobs = append(jobs, current.jobs.Jobs...)
+		pages = append(pages, current)
+		if len(jobs) == totalCount {
+			if s.metadata.EnableEtags {
+				s.stateMu.Lock()
+				if s.previousJobs == nil {
+					s.previousJobs = make(map[jobCacheKey][]githubJobPage)
+				}
+				s.previousJobs[key] = pages
+				s.stateMu.Unlock()
+			}
 			return jobs, nil
 		}
-		// Stale etag without a paired previousJobs entry, e.g. after pruneCaches
-		// evicted the previous entry. Drop the etag and retry as a cache miss.
-		s.stateMu.Lock()
-		delete(s.etags, apiURL)
-		s.stateMu.Unlock()
-		body, statusCode, err = s.getGithubRequest(ctx, apiURL, s.metadata, s.httpClient)
-		if err != nil {
-			return nil, err
-		}
-		if statusCode == 304 {
-			return nil, fmt.Errorf("request for jobs returned status: %d %s but previous jobs is not set", statusCode, http.StatusText(statusCode))
-		}
 	}
-
-	var jobs Jobs
-	err = json.Unmarshal(body, &jobs)
-	if err != nil {
-		return nil, err
-	}
-
-	if s.metadata.EnableEtags {
-		s.stateMu.Lock()
-		s.previousJobs[key] = jobs.Jobs
-		s.stateMu.Unlock()
-	}
-
-	return jobs.Jobs, nil
+	return nil, fmt.Errorf("workflow run %d exceeded %d jobs pages", workflowRunID, githubRunnerMaxJobPages)
 }
 
 // getWorkflowRuns returns a list of workflow runs for a given repository
@@ -893,6 +934,17 @@ func (s *githubRunnerScaler) pruneCaches(currentRepos []string) {
 	}
 	evictExcess(s.previousWfrs, githubScalerMaxCacheEntries)
 	evictExcess(s.previousJobs, githubScalerMaxCacheEntries)
+	cachedPages := 0
+	for _, pages := range s.previousJobs {
+		cachedPages += len(pages)
+	}
+	for key, pages := range s.previousJobs {
+		if cachedPages <= githubScalerMaxCacheEntries {
+			break
+		}
+		delete(s.previousJobs, key)
+		cachedPages -= len(pages)
+	}
 	evictExcess(s.etags, githubScalerMaxCacheEntries)
 }
 
@@ -910,7 +962,6 @@ func (s *githubRunnerScaler) pruneCompletedJobs(activeWfrs []WorkflowRun) {
 	for key := range s.previousJobs {
 		if _, ok := active[key]; !ok {
 			delete(s.previousJobs, key)
-			delete(s.etags, s.jobsAPIURL(key.repo, key.runID))
 		}
 	}
 }

@@ -200,7 +200,7 @@ func apiStubHandlerCustomJob(hasRateLeft bool, exceeds30Repos bool, jobResponse 
 			w.Header().Set("X-RateLimit-Remaining", "0")
 			w.WriteHeader(http.StatusForbidden)
 		}
-		if strings.HasSuffix(r.URL.String(), "jobs?per_page=100") {
+		if strings.HasSuffix(r.URL.String(), "jobs?per_page=30&page=1") {
 			// nosemgrep: no-direct-write-to-responsewriter
 			_, _ = w.Write([]byte(jobResponse))
 			w.WriteHeader(http.StatusOK)
@@ -505,8 +505,8 @@ func TestNewGitHubRunnerScaler_QueueLength_SingleRepo_WithNotModified(t *testing
 	if err := json.Unmarshal([]byte(testGhWFJobResponse), &jobs); err != nil {
 		t.Fail()
 	}
-	previousJobs := map[jobCacheKey][]Job{
-		{repo: "Hello-World", runID: 30433642}: jobs.Jobs,
+	previousJobs := map[jobCacheKey][]githubJobPage{
+		{repo: "Hello-World", runID: 30433642}: {{etag: `"jobs"`, jobs: jobs}},
 	}
 
 	mockGitHubRunnerScaler := githubRunnerScaler{
@@ -900,7 +900,7 @@ var githubRunnerMetricIdentifiers = []githubRunnerMetricIdentifier{
 func TestGithubRunnerPruneCachesDropsAbsentWfrRepos(t *testing.T) {
 	s := githubRunnerScaler{
 		metadata:     &githubRunnerMetadata{},
-		previousJobs: map[jobCacheKey][]Job{},
+		previousJobs: map[jobCacheKey][]githubJobPage{},
 		previousWfrs: map[string]map[string]*WorkflowRuns{
 			"keep-1": {"queued": &WorkflowRuns{}},
 			"drop-2": {"queued": &WorkflowRuns{}},
@@ -923,14 +923,10 @@ func TestGithubRunnerPruneCompletedJobsDropsFinishedRuns(t *testing.T) {
 
 	s := githubRunnerScaler{
 		metadata: meta,
-		previousJobs: map[jobCacheKey][]Job{
-			{repo: "repo", runID: 100}: nil, // still active, kept
-			{repo: "repo", runID: 200}: nil, // completed, dropped
+		previousJobs: map[jobCacheKey][]githubJobPage{
+			{repo: "repo", runID: 100}: {{etag: "etag-100"}}, // still active, kept
+			{repo: "repo", runID: 200}: {{etag: "etag-200"}}, // completed, dropped
 		},
-	}
-	s.etags = map[string]string{
-		s.jobsAPIURL("repo", 100): "etag-100", // still active, kept
-		s.jobsAPIURL("repo", 200): "etag-200", // completed, dropped
 	}
 
 	s.pruneCompletedJobs([]WorkflowRun{
@@ -943,11 +939,8 @@ func TestGithubRunnerPruneCompletedJobsDropsFinishedRuns(t *testing.T) {
 	if _, ok := s.previousJobs[jobCacheKey{repo: "repo", runID: 100}]; !ok {
 		t.Errorf("previousJobs lost still-active run 100 after pruneCompletedJobs")
 	}
-	if _, ok := s.etags[s.jobsAPIURL("repo", 200)]; ok {
-		t.Errorf("etags still contains completed run 200's jobs URL after pruneCompletedJobs")
-	}
-	if _, ok := s.etags[s.jobsAPIURL("repo", 100)]; !ok {
-		t.Errorf("etags lost still-active run 100's jobs URL after pruneCompletedJobs")
+	if got := s.previousJobs[jobCacheKey{repo: "repo", runID: 100}][0].etag; got != "etag-100" {
+		t.Errorf("active run lost its paired validator: %q", got)
 	}
 }
 
@@ -957,7 +950,7 @@ func TestGithubRunnerPruneCachesBoundsMaps(t *testing.T) {
 
 	s := githubRunnerScaler{
 		metadata:     &githubRunnerMetadata{},
-		previousJobs: make(map[jobCacheKey][]Job, overflow),
+		previousJobs: make(map[jobCacheKey][]githubJobPage, overflow),
 		previousWfrs: make(map[string]map[string]*WorkflowRuns, overflow),
 		etags:        make(map[string]string, overflow),
 	}
@@ -985,7 +978,7 @@ func TestGithubRunnerPruneCachesBoundsMaps(t *testing.T) {
 	}
 }
 
-func TestGetWorkflowRunJobs_StaleEtagWithoutPreviousRetries(t *testing.T) {
+func TestGetWorkflowRunJobs_IgnoresUnpairedEtag(t *testing.T) {
 	var mu sync.Mutex
 	var sawIfNoneMatch, sawNoIfNoneMatch bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1006,14 +999,14 @@ func TestGetWorkflowRunJobs_StaleEtagWithoutPreviousRetries(t *testing.T) {
 
 	meta := getGitHubTestMetaData(srv.URL)
 	meta.EnableEtags = true
-	apiURL := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100",
+	apiURL := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=30&page=1",
 		meta.GithubAPIURL, meta.Owner, "Hello-World", int64(30433642))
 
 	s := githubRunnerScaler{
 		metadata:     meta,
 		httpClient:   http.DefaultClient,
 		etags:        map[string]string{apiURL: `"stale-etag"`},
-		previousJobs: map[jobCacheKey][]Job{},
+		previousJobs: map[jobCacheKey][]githubJobPage{},
 		previousWfrs: map[string]map[string]*WorkflowRuns{},
 	}
 
@@ -1027,11 +1020,11 @@ func TestGetWorkflowRunJobs_StaleEtagWithoutPreviousRetries(t *testing.T) {
 	mu.Lock()
 	gotIfNoneMatch, gotNoIfNoneMatch := sawIfNoneMatch, sawNoIfNoneMatch
 	mu.Unlock()
-	if !gotIfNoneMatch || !gotNoIfNoneMatch {
-		t.Fatalf("expected one request with If-None-Match and one without, got ifNoneMatch=%v noIfNoneMatch=%v", gotIfNoneMatch, gotNoIfNoneMatch)
+	if gotIfNoneMatch || !gotNoIfNoneMatch {
+		t.Fatalf("unpaired validators must not be sent: ifNoneMatch=%v noIfNoneMatch=%v", gotIfNoneMatch, gotNoIfNoneMatch)
 	}
-	if got := s.etags[apiURL]; got != `"fresh-etag"` {
-		t.Fatalf("expected etag to be refreshed to %q, got %q", `"fresh-etag"`, got)
+	if got := s.previousJobs[jobCacheKey{repo: "Hello-World", runID: 30433642}][0].etag; got != `"fresh-etag"` {
+		t.Fatalf("expected paired etag %q, got %q", `"fresh-etag"`, got)
 	}
 }
 
@@ -1059,8 +1052,8 @@ func TestGetWorkflowRunJobs_PerRunCacheDoesNotConflateConcurrentRuns(t *testing.
 	meta := getGitHubTestMetaData(srv.URL)
 	meta.EnableEtags = true
 
-	urlA := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100", meta.GithubAPIURL, meta.Owner, repo, runA)
-	urlB := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=100", meta.GithubAPIURL, meta.Owner, repo, runB)
+	urlA := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=30&page=1", meta.GithubAPIURL, meta.Owner, repo, runA)
+	urlB := fmt.Sprintf("%s/repos/%s/%s/actions/runs/%d/jobs?per_page=30&page=1", meta.GithubAPIURL, meta.Owner, repo, runB)
 
 	s := githubRunnerScaler{
 		metadata:   meta,
@@ -1069,9 +1062,9 @@ func TestGetWorkflowRunJobs_PerRunCacheDoesNotConflateConcurrentRuns(t *testing.
 			urlA: `"etag-a"`,
 			urlB: `"etag-b"`,
 		},
-		previousJobs: map[jobCacheKey][]Job{
-			{repo: repo, runID: runA}: jobsA,
-			{repo: repo, runID: runB}: jobsB,
+		previousJobs: map[jobCacheKey][]githubJobPage{
+			{repo: repo, runID: runA}: {{etag: `"etag-a"`, jobs: Jobs{TotalCount: len(jobsA), Jobs: jobsA}}},
+			{repo: repo, runID: runB}: {{etag: `"etag-b"`, jobs: Jobs{TotalCount: len(jobsB), Jobs: jobsB}}},
 		},
 	}
 
@@ -1120,7 +1113,7 @@ func TestGetWorkflowRuns_StaleEtagWithoutPreviousRetries(t *testing.T) {
 		metadata:     meta,
 		httpClient:   http.DefaultClient,
 		etags:        map[string]string{apiURL: `"stale-etag"`},
-		previousJobs: map[jobCacheKey][]Job{},
+		previousJobs: map[jobCacheKey][]githubJobPage{},
 		previousWfrs: map[string]map[string]*WorkflowRuns{},
 	}
 
@@ -1293,7 +1286,7 @@ func TestGetWorkflowQueueLength_BoundsConcurrentJobRequests(t *testing.T) {
 		metadata:     meta,
 		httpClient:   http.DefaultClient,
 		etags:        map[string]string{},
-		previousJobs: map[jobCacheKey][]Job{},
+		previousJobs: map[jobCacheKey][]githubJobPage{},
 		previousWfrs: map[string]map[string]*WorkflowRuns{},
 	}
 
