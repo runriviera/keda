@@ -227,10 +227,10 @@ func TestGetWorkflowRunJobs_InvalidPaginationFailsClosed(t *testing.T) {
 		page1 Jobs
 		page2 Jobs
 	}{
-		{name: "negative total", page1: Jobs{TotalCount: -1}},
-		{name: "excessive total", page1: Jobs{TotalCount: githubRunnerMaxJobPages*githubDefaultPerPage + 1}},
+		{name: "negative total", page1: Jobs{TotalCount: -1, Jobs: []Job{}}},
+		{name: "excessive total", page1: Jobs{TotalCount: githubRunnerMaxJobPages*githubDefaultPerPage + 1, Jobs: []Job{}}},
 		{name: "truncated first page", page1: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1}}}},
-		{name: "truncated last page", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31}},
+		{name: "truncated last page", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{}}},
 		{name: "changing total", page1: paginationTestJobs(1, 31, "queued"), page2: paginationTestJobs(2, 32, "queued")},
 		{name: "duplicate job", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1}}}},
 	}
@@ -336,5 +336,46 @@ func TestGithubRunnerPruneCachesBoundsJobPages(t *testing.T) {
 	}
 	if pages > githubScalerMaxCacheEntries {
 		t.Fatalf("cached job pages %d exceed bound %d", pages, githubScalerMaxCacheEntries)
+	}
+}
+
+func TestGetWorkflowRunJobs_BoundsCacheOnCommit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		_ = json.NewEncoder(w).Encode(paginationTestJobs(page, 31, "queued"))
+	}))
+	defer srv.Close()
+	s := paginationTestScaler(srv.URL, true)
+	for runID := int64(1); runID <= 5; runID++ {
+		s.previousJobs[jobCacheKey{repo: "repo", runID: runID}] = make([]githubJobPage, githubRunnerMaxJobPages)
+	}
+	jobs, err := s.getWorkflowRunJobs(context.Background(), 42, "repo")
+	if err != nil || len(jobs) != 31 {
+		t.Fatalf("complete scan: %d jobs, error %v", len(jobs), err)
+	}
+	pages := 0
+	for _, cached := range s.previousJobs {
+		pages += len(cached)
+	}
+	if pages > githubScalerMaxCacheEntries {
+		t.Fatalf("cache commit retained %d pages, limit %d", pages, githubScalerMaxCacheEntries)
+	}
+}
+
+func TestGetWorkflowRunJobs_RejectsInvalidResponseShape(t *testing.T) {
+	for _, body := range []string{`{}`, `{"message":"unexpected upstream response"}`, `{"total_count":0}`, `{"jobs":[]}`, `{"total_count":0,"jobs":null}`, `{"total_count":1,"jobs":`} {
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("ETag", `"invalid"`)
+				// nosemgrep: no-direct-write-to-responsewriter
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			s := paginationTestScaler(srv.URL, true)
+			jobs, err := s.getWorkflowRunJobs(context.Background(), 42, "repo")
+			if err == nil || jobs != nil || len(s.previousJobs) != 0 {
+				t.Fatalf("invalid response published demand: jobs %v, error %v, cached runs %d", jobs, err, len(s.previousJobs))
+			}
+		})
 	}
 }

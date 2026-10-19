@@ -748,9 +748,17 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 			}
 			current = cached
 		} else {
-			if err := json.Unmarshal(body, &current.jobs); err != nil {
+			var response struct {
+				TotalCount *int  `json:"total_count"`
+				Jobs       []Job `json:"jobs"`
+			}
+			if err := json.Unmarshal(body, &response); err != nil {
 				return nil, fmt.Errorf("decode workflow run %d jobs page %d: %w", workflowRunID, page, err)
 			}
+			if response.TotalCount == nil || response.Jobs == nil {
+				return nil, fmt.Errorf("workflow run %d jobs page %d is missing total_count or jobs", workflowRunID, page)
+			}
+			current.jobs = Jobs{TotalCount: *response.TotalCount, Jobs: response.Jobs}
 			current.etag = etag
 		}
 
@@ -781,6 +789,7 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 					s.previousJobs = make(map[jobCacheKey][]githubJobPage)
 				}
 				s.previousJobs[key] = pages
+				s.pruneJobCacheLocked()
 				s.stateMu.Unlock()
 			}
 			return jobs, nil
@@ -933,6 +942,13 @@ func (s *githubRunnerScaler) pruneCaches(currentRepos []string) {
 		}
 	}
 	evictExcess(s.previousWfrs, githubScalerMaxCacheEntries)
+	s.pruneJobCacheLocked()
+	evictExcess(s.etags, githubScalerMaxCacheEntries)
+}
+
+// pruneJobCacheLocked evicts whole runs so validators and bodies stay paired.
+// The caller must hold stateMu.
+func (s *githubRunnerScaler) pruneJobCacheLocked() {
 	evictExcess(s.previousJobs, githubScalerMaxCacheEntries)
 	cachedPages := 0
 	for _, pages := range s.previousJobs {
@@ -945,7 +961,6 @@ func (s *githubRunnerScaler) pruneCaches(currentRepos []string) {
 		delete(s.previousJobs, key)
 		cachedPages -= len(pages)
 	}
-	evictExcess(s.etags, githubScalerMaxCacheEntries)
 }
 
 // pruneCompletedJobs removes previousJobs entries for runs that are no
