@@ -10,7 +10,6 @@ env:
 
 jobs:
   triage:
-    if: github.repository == 'kedacore/keda'
     runs-on: ubuntu-latest
     name: Comment evaluate
     container: ghcr.io/kedacore/keda-tools:1.26.2
@@ -73,7 +72,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     name: Build images
     container: ghcr.io/kedacore/keda-tools:1.26.2
-    if: github.repository == 'kedacore/keda' && needs.triage.outputs.run-e2e == 'true'
+    if: needs.triage.outputs.run-e2e == 'true'
     steps:
       - name: Set status in-progress
         uses: LouisBrunner/checks-action@937cbbcde3259005b50746dc91cde29098aac2ff # v3.1.0
@@ -207,7 +206,7 @@ jobs:
     runs-on: e2e
     name: Execute e2e tests
     container: ghcr.io/kedacore/keda-tools:1.26.2
-    if: github.repository == 'kedacore/keda' && needs.triage.outputs.run-e2e == 'true'
+    if: needs.triage.outputs.run-e2e == 'true'
     outputs:
       test-outcome: ${{ steps.test.outcome }}
     steps:
@@ -385,7 +384,7 @@ jobs:
     needs: [triage, build-test-images]
     runs-on: ubuntu-24.04-arm
     name: Execute ARM smoke tests
-    if: github.repository == 'kedacore/keda' && needs.triage.outputs.run-e2e == 'true'
+    if: needs.triage.outputs.run-e2e == 'true'
     outputs:
       test-outcome: ${{ steps.test.outcome }}
     steps:
@@ -466,7 +465,7 @@ jobs:
     needs: [triage, build-test-images]
     runs-on: s390x
     name: Execute s390x smoke tests
-    if: github.repository == 'kedacore/keda' && needs.triage.outputs.run-e2e == 'true'
+    if: needs.triage.outputs.run-e2e == 'true'
     outputs:
       test-outcome: ${{ steps.test.outcome }}
     steps:
@@ -561,7 +560,7 @@ jobs:
     needs: [triage, run-e2e-test, run-arm-smoke-test, run-s390x-smoke-test]
     runs-on: ubuntu-latest
     name: Report combined reaction
-    if: ${{ always() && github.repository == 'kedacore/keda' && needs.triage.outputs.run-e2e == 'true' }}
+    if: ${{ always() && needs.triage.outputs.run-e2e == 'true' }}
     steps:
       - name: React to comment with success
         if: >-
