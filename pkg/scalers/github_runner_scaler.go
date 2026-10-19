@@ -775,6 +775,9 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 			return nil, fmt.Errorf("workflow run %d jobs page %d returned %d jobs, expected %d", workflowRunID, page, len(current.jobs.Jobs), expected)
 		}
 		for _, job := range current.jobs.Jobs {
+			if job.ID <= 0 || strings.TrimSpace(job.Status) == "" {
+				return nil, fmt.Errorf("workflow run %d jobs page %d returned an invalid job: id %d, status %q", workflowRunID, page, job.ID, job.Status)
+			}
 			if _, ok := seen[job.ID]; ok {
 				return nil, fmt.Errorf("workflow run %d returned duplicate job %d during pagination", workflowRunID, job.ID)
 			}

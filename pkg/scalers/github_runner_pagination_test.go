@@ -229,10 +229,10 @@ func TestGetWorkflowRunJobs_InvalidPaginationFailsClosed(t *testing.T) {
 	}{
 		{name: "negative total", page1: Jobs{TotalCount: -1, Jobs: []Job{}}},
 		{name: "excessive total", page1: Jobs{TotalCount: githubRunnerMaxJobPages*githubDefaultPerPage + 1, Jobs: []Job{}}},
-		{name: "truncated first page", page1: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1}}}},
+		{name: "truncated first page", page1: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1, Status: "queued"}}}},
 		{name: "truncated last page", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{}}},
 		{name: "changing total", page1: paginationTestJobs(1, 31, "queued"), page2: paginationTestJobs(2, 32, "queued")},
-		{name: "duplicate job", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1}}}},
+		{name: "duplicate job", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1, Status: "queued"}}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -295,7 +295,7 @@ func TestGetWorkflowRunJobs_CacheIsolatedByRepositoryAndRun(t *testing.T) {
 			return
 		}
 		w.Header().Set("ETag", etag)
-		_ = json.NewEncoder(w).Encode(Jobs{TotalCount: 1, Jobs: []Job{{ID: len(key), Name: key}}})
+		_ = json.NewEncoder(w).Encode(Jobs{TotalCount: 1, Jobs: []Job{{ID: len(key), Name: key, Status: "queued"}}})
 	}))
 	defer srv.Close()
 	s := paginationTestScaler(srv.URL, true)
@@ -375,6 +375,44 @@ func TestGetWorkflowRunJobs_RejectsInvalidResponseShape(t *testing.T) {
 			jobs, err := s.getWorkflowRunJobs(context.Background(), 42, "repo")
 			if err == nil || jobs != nil || len(s.previousJobs) != 0 {
 				t.Fatalf("invalid response published demand: jobs %v, error %v, cached runs %d", jobs, err, len(s.previousJobs))
+			}
+		})
+	}
+}
+
+func TestGetWorkflowRunJobs_RejectsInvalidJobs(t *testing.T) {
+	tests := []struct {
+		name string
+		job  string
+	}{
+		{name: "missing id", job: `{"status":"queued"}`},
+		{name: "null id", job: `{"id":null,"status":"queued"}`},
+		{name: "zero id", job: `{"id":0,"status":"queued"}`},
+		{name: "negative id", job: `{"id":-1,"status":"queued"}`},
+		{name: "missing status", job: `{"id":1}`},
+		{name: "null status", job: `{"id":1,"status":null}`},
+		{name: "empty status", job: `{"id":1,"status":""}`},
+		{name: "blank status", job: `{"id":1,"status":"  "}`},
+		{name: "null job", job: `null`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("ETag", `"invalid"`)
+				// nosemgrep: no-direct-write-to-responsewriter
+				_, _ = fmt.Fprintf(w, `{"total_count":1,"jobs":[%s]}`, tt.job)
+			}))
+			defer srv.Close()
+			s := paginationTestScaler(srv.URL, true)
+			key := jobCacheKey{repo: "repo", runID: 42}
+			previous := []githubJobPage{{etag: `"previous"`, jobs: paginationTestJobs(1, 1, "queued")}}
+			s.previousJobs[key] = previous
+			jobs, err := s.getWorkflowRunJobs(context.Background(), 42, "repo")
+			if err == nil || jobs != nil {
+				t.Fatalf("invalid job returned partial demand: jobs %v, error %v", jobs, err)
+			}
+			if !reflect.DeepEqual(s.previousJobs[key], previous) {
+				t.Fatal("invalid job replaced the previous complete cache")
 			}
 		})
 	}
