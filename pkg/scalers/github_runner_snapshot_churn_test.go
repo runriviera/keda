@@ -212,6 +212,8 @@ func TestGetWorkflowRunJobs_CancellationPreventsSnapshotRestart(t *testing.T) {
 	defer cancel()
 	requests := 0
 	s := paginationTestScaler("https://github.invalid", true)
+	var diagnostics []string
+	s.logger = funcr.New(func(_, message string) { diagnostics = append(diagnostics, message) }, funcr.Options{})
 	s.httpClient = &http.Client{Transport: githubSnapshotTestTransport(func(r *http.Request) (*http.Response, error) {
 		requests++
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
@@ -226,6 +228,9 @@ func TestGetWorkflowRunJobs_CancellationPreventsSnapshotRestart(t *testing.T) {
 	jobs, err := s.getWorkflowRunJobs(ctx, 42, "repo")
 	if !errors.Is(err, context.Canceled) || jobs != nil || requests != 2 || len(s.previousJobs) != 0 {
 		t.Fatalf("canceled snapshot restarted or committed: jobs %v, error %v, requests %d", jobs, err, requests)
+	}
+	if len(diagnostics) != 0 {
+		t.Fatalf("already canceled snapshot announced a restart: %v", diagnostics)
 	}
 }
 

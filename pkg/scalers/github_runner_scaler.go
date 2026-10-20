@@ -747,6 +747,9 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 	err = githubJobSnapshotContextError(ctx, workflowRunID, err)
 	var changed *githubJobSnapshotChangedError
 	if errors.As(err, &changed) {
+		if ctx.Err() != nil {
+			return nil, githubJobSnapshotContextError(ctx, workflowRunID, nil)
+		}
 		// A workflow can add or replace jobs while pages are in flight. Start
 		// once more without validators so no page from the old snapshot is reused.
 		s.logger.Info("Restarting GitHub workflow job snapshot after count changed", "runID", workflowRunID, "repo", repoName, "attempt", 2)
@@ -773,7 +776,7 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 
 func githubJobSnapshotContextError(ctx context.Context, workflowRunID int64, err error) error {
 	ctxErr := ctx.Err()
-	if ctxErr == nil {
+	if ctxErr == nil || (err != nil && !errors.Is(err, ctxErr)) {
 		return err
 	}
 	var requestErr *url.Error
@@ -1171,7 +1174,11 @@ func (s *githubRunnerScaler) GetMetricsAndActivity(ctx context.Context, metricNa
 	queueLen, err := s.GetWorkflowQueueLength(ctx)
 
 	if err != nil {
-		s.logger.Error(err, "error getting workflow queue length")
+		if errors.Is(err, context.Canceled) && errors.Is(ctx.Err(), context.Canceled) {
+			s.logger.Info("Workflow queue scan canceled")
+		} else {
+			s.logger.Error(err, "error getting workflow queue length")
+		}
 		return []external_metrics.ExternalMetricValue{}, false, err
 	}
 
