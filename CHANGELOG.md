@@ -86,6 +86,7 @@ To learn more about active deprecations, we recommend checking [GitHub Discussio
 
 - **Github Runner Scaler**: Fetch every workflow-job page with smaller responses and revalidate paired page caches before publishing complete queue demand ([#2](https://github.com/runriviera/keda/issues/2))
 - **Github Runner Scaler**: Fix per-repository ETag job cache returning another concurrent workflow run's jobs, inflating the computed queue length when a repository has multiple simultaneous queued/in_progress runs ([#7949](https://github.com/kedacore/keda/issues/7949))
+- **Github Runner Scaler**: Restart a changing workflow-job snapshot once within a shared deadline while preserving complete demand and paired page caches ([RIV-4046](https://linear.app/riviera/issue/RIV-4046))
 
 ### Deprecations
 

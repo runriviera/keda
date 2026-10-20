@@ -231,7 +231,6 @@ func TestGetWorkflowRunJobs_InvalidPaginationFailsClosed(t *testing.T) {
 		{name: "excessive total", page1: Jobs{TotalCount: githubRunnerMaxJobPages*githubDefaultPerPage + 1, Jobs: []Job{}}},
 		{name: "truncated first page", page1: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1, Status: "queued"}}}},
 		{name: "truncated last page", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{}}},
-		{name: "changing total", page1: paginationTestJobs(1, 31, "queued"), page2: paginationTestJobs(2, 32, "queued")},
 		{name: "duplicate job", page1: paginationTestJobs(1, 31, "queued"), page2: Jobs{TotalCount: 31, Jobs: []Job{{ID: 1, Status: "queued"}}}},
 	}
 	for _, tt := range tests {

@@ -3,6 +3,7 @@ package scalers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -47,6 +48,9 @@ const (
 	// Bound pagination even if GitHub returns an inconsistent or growing total.
 	// Exceeding this limit fails the scan instead of publishing partial demand.
 	githubRunnerMaxJobPages = 1000
+	// Both snapshot attempts share this budget, including GitHub App clients
+	// whose transport does not set an HTTP client timeout.
+	githubRunnerJobSnapshotTimeout = 30 * time.Second
 )
 
 var reservedLabels = []string{"self-hosted", "linux", "x64"}
@@ -64,6 +68,16 @@ type jobCacheKey struct {
 type githubJobPage struct {
 	etag string
 	jobs Jobs
+}
+
+type githubJobSnapshotChangedError struct {
+	workflowRunID int64
+	previousCount int
+	currentCount  int
+}
+
+func (e *githubJobSnapshotChangedError) Error() string {
+	return fmt.Sprintf("GitHub workflow job snapshot changed during pagination: run %d total_count %d to %d", e.workflowRunID, e.previousCount, e.currentCount)
 }
 
 type githubRunnerScaler struct {
@@ -672,7 +686,7 @@ func (s *githubRunnerScaler) getGithubRequestWithETag(ctx context.Context, apiUR
 
 	b, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, -1, "", err
+		return nil, -1, "", &url.Error{Op: "Get", URL: apiURL, Err: err}
 	}
 
 	return b, r.StatusCode, r.Header.Get("ETag"), nil
@@ -721,16 +735,66 @@ func (s *githubRunnerScaler) jobsAPIURL(repoName string, workflowRunID int64, pa
 
 // getWorkflowRunJobs returns a complete, freshly validated list of jobs for a run.
 func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRunID int64, repoName string) ([]Job, error) {
+	ctx, cancel := context.WithTimeout(ctx, githubRunnerJobSnapshotTimeout)
+	defer cancel()
+
 	key := jobCacheKey{repo: repoName, runID: workflowRunID}
 	s.stateMu.RLock()
 	previousPages := s.previousJobs[key]
 	s.stateMu.RUnlock()
 
+	jobs, pages, err := s.getWorkflowRunJobPages(ctx, workflowRunID, repoName, previousPages)
+	err = githubJobSnapshotContextError(ctx, workflowRunID, err)
+	var changed *githubJobSnapshotChangedError
+	if errors.As(err, &changed) {
+		// A workflow can add or replace jobs while pages are in flight. Start
+		// once more without validators so no page from the old snapshot is reused.
+		s.logger.Info("Restarting GitHub workflow job snapshot after count changed", "runID", workflowRunID, "repo", repoName, "attempt", 2)
+		jobs, pages, err = s.getWorkflowRunJobPages(ctx, workflowRunID, repoName, nil)
+		err = githubJobSnapshotContextError(ctx, workflowRunID, err)
+		if errors.As(err, &changed) {
+			return nil, fmt.Errorf("after 2 attempts: %w", err)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if s.metadata.EnableEtags {
+		s.stateMu.Lock()
+		if s.previousJobs == nil {
+			s.previousJobs = make(map[jobCacheKey][]githubJobPage)
+		}
+		s.previousJobs[key] = pages
+		s.pruneJobCacheLocked()
+		s.stateMu.Unlock()
+	}
+	return jobs, nil
+}
+
+func githubJobSnapshotContextError(ctx context.Context, workflowRunID int64, err error) error {
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return err
+	}
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) && errors.Is(err, ctxErr) {
+		return err
+	}
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return fmt.Errorf("GitHub workflow job snapshot deadline exceeded: run %d: %w", workflowRunID, ctxErr)
+	}
+	return ctxErr
+}
+
+func (s *githubRunnerScaler) getWorkflowRunJobPages(ctx context.Context, workflowRunID int64, repoName string, previousPages []githubJobPage) ([]Job, []githubJobPage, error) {
 	var pages []githubJobPage
 	var jobs []Job
 	totalCount := -1
 	seen := make(map[int]struct{})
 	for page := 1; page <= githubRunnerMaxJobPages; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		apiURL := s.jobsAPIURL(repoName, workflowRunID, page)
 		var cached githubJobPage
 		if s.metadata.EnableEtags && page <= len(previousPages) {
@@ -738,13 +802,13 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 		}
 		body, statusCode, etag, err := s.getGithubRequestWithETag(ctx, apiURL, s.metadata, s.httpClient, cached.etag)
 		if err != nil {
-			return nil, fmt.Errorf("get workflow run %d jobs page %d: %w", workflowRunID, page, err)
+			return nil, nil, fmt.Errorf("get workflow run %d jobs page %d: %w", workflowRunID, page, err)
 		}
 
 		var current githubJobPage
 		if statusCode == http.StatusNotModified {
 			if cached.etag == "" {
-				return nil, fmt.Errorf("workflow run %d jobs page %d returned 304 without a cached page", workflowRunID, page)
+				return nil, nil, fmt.Errorf("workflow run %d jobs page %d returned 304 without a cached page", workflowRunID, page)
 			}
 			current = cached
 		} else {
@@ -753,52 +817,45 @@ func (s *githubRunnerScaler) getWorkflowRunJobs(ctx context.Context, workflowRun
 				Jobs       []Job `json:"jobs"`
 			}
 			if err := json.Unmarshal(body, &response); err != nil {
-				return nil, fmt.Errorf("decode workflow run %d jobs page %d: %w", workflowRunID, page, err)
+				return nil, nil, fmt.Errorf("decode workflow run %d jobs page %d: %w", workflowRunID, page, err)
 			}
 			if response.TotalCount == nil || response.Jobs == nil {
-				return nil, fmt.Errorf("workflow run %d jobs page %d is missing total_count or jobs", workflowRunID, page)
+				return nil, nil, fmt.Errorf("workflow run %d jobs page %d is missing total_count or jobs", workflowRunID, page)
 			}
 			current.jobs = Jobs{TotalCount: *response.TotalCount, Jobs: response.Jobs}
 			current.etag = etag
 		}
 
-		if page == 1 {
-			totalCount = current.jobs.TotalCount
-			if totalCount < 0 || totalCount > githubRunnerMaxJobPages*githubDefaultPerPage {
-				return nil, fmt.Errorf("workflow run %d job count %d exceeds pagination bounds", workflowRunID, totalCount)
-			}
-		} else if current.jobs.TotalCount != totalCount {
-			return nil, fmt.Errorf("workflow run %d job count changed during pagination: %d to %d", workflowRunID, totalCount, current.jobs.TotalCount)
+		if current.jobs.TotalCount < 0 || current.jobs.TotalCount > githubRunnerMaxJobPages*githubDefaultPerPage {
+			return nil, nil, fmt.Errorf("workflow run %d job count %d exceeds pagination bounds", workflowRunID, current.jobs.TotalCount)
 		}
-		expected := min(githubDefaultPerPage, totalCount-len(jobs))
+		// Validate this page independently before interpreting a count change as
+		// a transient snapshot race. Malformed data must remain a terminal error.
+		expected := min(githubDefaultPerPage, max(0, current.jobs.TotalCount-(page-1)*githubDefaultPerPage))
 		if len(current.jobs.Jobs) != expected {
-			return nil, fmt.Errorf("workflow run %d jobs page %d returned %d jobs, expected %d", workflowRunID, page, len(current.jobs.Jobs), expected)
+			return nil, nil, fmt.Errorf("workflow run %d jobs page %d returned %d jobs, expected %d", workflowRunID, page, len(current.jobs.Jobs), expected)
 		}
 		for _, job := range current.jobs.Jobs {
 			if job.ID <= 0 || strings.TrimSpace(job.Status) == "" {
-				return nil, fmt.Errorf("workflow run %d jobs page %d returned an invalid job: id %d, status %q", workflowRunID, page, job.ID, job.Status)
+				return nil, nil, fmt.Errorf("workflow run %d jobs page %d returned an invalid job: id %d, status %q", workflowRunID, page, job.ID, job.Status)
 			}
 			if _, ok := seen[job.ID]; ok {
-				return nil, fmt.Errorf("workflow run %d returned duplicate job %d during pagination", workflowRunID, job.ID)
+				return nil, nil, fmt.Errorf("workflow run %d returned duplicate job %d during pagination", workflowRunID, job.ID)
 			}
 			seen[job.ID] = struct{}{}
+		}
+		if page == 1 {
+			totalCount = current.jobs.TotalCount
+		} else if current.jobs.TotalCount != totalCount {
+			return nil, nil, &githubJobSnapshotChangedError{workflowRunID: workflowRunID, previousCount: totalCount, currentCount: current.jobs.TotalCount}
 		}
 		jobs = append(jobs, current.jobs.Jobs...)
 		pages = append(pages, current)
 		if len(jobs) == totalCount {
-			if s.metadata.EnableEtags {
-				s.stateMu.Lock()
-				if s.previousJobs == nil {
-					s.previousJobs = make(map[jobCacheKey][]githubJobPage)
-				}
-				s.previousJobs[key] = pages
-				s.pruneJobCacheLocked()
-				s.stateMu.Unlock()
-			}
-			return jobs, nil
+			return jobs, pages, nil
 		}
 	}
-	return nil, fmt.Errorf("workflow run %d exceeded %d jobs pages", workflowRunID, githubRunnerMaxJobPages)
+	return nil, nil, fmt.Errorf("workflow run %d exceeded %d jobs pages", workflowRunID, githubRunnerMaxJobPages)
 }
 
 // getWorkflowRuns returns a list of workflow runs for a given repository
@@ -1078,6 +1135,10 @@ func (s *githubRunnerScaler) GetWorkflowQueueLength(ctx context.Context) (int64,
 
 	jobsByRun, err := s.getWorkflowRunJobsConcurrently(ctx, wfrs)
 	if err != nil {
+		var changed *githubJobSnapshotChangedError
+		if errors.As(err, &changed) {
+			return -1, err
+		}
 		if s.isRateLimited() {
 			return s.getCachedQueueLength()
 		}
